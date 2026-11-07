@@ -15196,7 +15196,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
 
-    def _reset_notice_session_info(self, source: SessionSource) -> str:
+    def _reset_notice_session_info(
+        self, source: SessionSource, override: Optional[dict] = None
+    ) -> str:
         """Session-info block for the auto-reset notice, profile-scoped.
 
         When multiplexing, resolve model/provider/context inside the profile
@@ -15213,10 +15215,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if getattr(getattr(self, "config", None), "multiplex_profiles", False):
             with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
-                return self._format_session_info()
-        return self._format_session_info()
+                return self._format_session_info(override=override, source=source)
+        return self._format_session_info(override=override, source=source)
 
-    def _format_session_info(self) -> str:
+    def _format_session_info(
+        self,
+        override: Optional[dict] = None,
+        source: Optional[SessionSource] = None,
+    ) -> str:
         """Resolve current model config and return a formatted info block.
 
         Surfaces model, provider, context length, and endpoint so gateway
@@ -15225,16 +15231,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         from agent.model_metadata import get_model_context_length, DEFAULT_FALLBACK_CONTEXT
 
-        model = _resolve_gateway_model()
-        config_context_length = None
+        model = None
         provider = None
         base_url = None
         api_key = None
+        config_context_length = None
         custom_provs = None
         data = None
         configured_model = None
         configured_provider = None
         configured_base_url = None
+
+        if override and override.get("model"):
+            model = override.get("model")
+            provider = override.get("provider")
+            base_url = override.get("base_url")
+            api_key = override.get("api_key")
+        elif source is not None and hasattr(self, "_resolve_session_agent_runtime"):
+            try:
+                model, runtime_kwargs = self._resolve_session_agent_runtime(source=source)
+                provider = runtime_kwargs.get("provider")
+                base_url = runtime_kwargs.get("base_url")
+                api_key = runtime_kwargs.get("api_key")
+            except Exception:
+                model = None
+
+        if not model:
+            model = _resolve_gateway_model()
+
+        # An explicit session override is authoritative for the WHOLE line:
+        # provider and base_url must not be clobbered by the config default
+        # or by runtime resolution. Without this the /new banner advertised
+        # "Provider: custom" (the config's generic label) while the session
+        # actually ran on custom:wildanoel — a banner that lies about the
+        # live route (#banner-override-clobber).
+        _has_override = bool(override and override.get("model"))
 
         try:
             data = _load_gateway_config()
@@ -15248,8 +15279,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             config_context_length = int(raw_ctx)
                         except (TypeError, ValueError):
                             pass
-                    provider = model_cfg.get("provider") or None
-                    base_url = model_cfg.get("base_url") or None
+                    if not _has_override:
+                        provider = model_cfg.get("provider") or None
+                        base_url = model_cfg.get("base_url") or None
                     configured_provider = provider
                     configured_base_url = base_url
                 try:
@@ -15260,12 +15292,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
-        # Resolve runtime credentials for probing
+        # Resolve runtime credentials for probing. An explicit session
+        # override already names the live provider + endpoint, so runtime
+        # resolution must not overwrite them with the config default route
+        # (#banner-override-clobber). Credentials are still resolved — the
+        # override's provider may need a key that only runtime resolution
+        # knows about.
         try:
             runtime = _resolve_runtime_agent_kwargs()
-            provider = runtime.get("provider") or provider
-            base_url = runtime.get("base_url") or base_url
-            api_key = runtime.get("api_key")
+            if not _has_override:
+                provider = runtime.get("provider") or provider
+                base_url = runtime.get("base_url") or base_url
+            api_key = runtime.get("api_key") or api_key
         except Exception:
             pass
 
@@ -19325,7 +19363,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Failed to read persisted session model override", exc_info=True
             )
             return
-        if not persisted:
+        if not isinstance(persisted, dict) or not isinstance(persisted.get("model"), str):
             return
         override: Dict[str, Any] = {
             "model": persisted.get("model"),
@@ -20434,8 +20472,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         def _pause_typing_before_finalize(
                             _adapter=_adapter,
                             _chat_id=source.chat_id,
+                            _meta=_thread_metadata,
                         ) -> None:
-                            _adapter.pause_typing_for_chat(_chat_id)
+                            _adapter.pause_typing_for_chat(_chat_id, metadata=_meta)
                     _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
                     _effective_cursor = _scfg.cursor if _adapter_supports_edit else ""
                     _buffer_only = False
@@ -22016,9 +22055,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             def _pause_typing_before_finalize(
                                 _adapter=_adapter,
                                 _chat_id=source.chat_id,
+                                _meta=_thread_metadata,
                             ) -> None:
-                                _adapter.pause_typing_for_chat(_chat_id)
-                        # Platforms that don't support editing sent messages
+                                _adapter.pause_typing_for_chat(_chat_id, metadata=_meta)
+                            # Platforms that don't support editing sent messages
                         # (e.g. QQ, WeChat) should skip streaming entirely —
                         # without edit support, the consumer sends a partial
                         # first message that can never be updated, resulting in
@@ -24264,23 +24304,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _adapter_snapshot = _cleanup_adapter
             _loop_snapshot = asyncio.get_running_loop()
 
-            def _cleanup_temp_bubbles() -> None:
-                async def _delete_all() -> None:
-                    for _mid in _ids_snapshot:
-                        try:
-                            await _adapter_snapshot.delete_message(
-                                _chat_id_snapshot, _mid
-                            )
-                        except Exception:
-                            pass
-                try:
-                    safe_schedule_threadsafe(
-                        _delete_all(), _loop_snapshot,
-                        logger=logger,
-                        log_message="Temp bubble cleanup scheduling error",
-                    )
-                except Exception:
-                    pass
+            async def _cleanup_temp_bubbles() -> None:
+                for _mid in _ids_snapshot:
+                    try:
+                        await _adapter_snapshot.delete_message(
+                            _chat_id_snapshot, _mid
+                        )
+                    except Exception:
+                        pass
 
             try:
                 _cleanup_adapter.register_post_delivery_callback(

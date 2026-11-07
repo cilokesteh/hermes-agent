@@ -200,6 +200,34 @@ class TestKeepTypingTimeoutPerTick:
         )
 
     @pytest.mark.asyncio
+    async def test_pausing_one_topic_does_not_suppress_another_topic(self, monkeypatch):
+        """Typing pause state must be isolated by thread/topic within a chat."""
+        adapter = _StubAdapter()
+        calls = []
+
+        async def recording_send_typing(chat_id, metadata=None):
+            calls.append((chat_id, metadata))
+
+        monkeypatch.setattr(adapter, "send_typing", recording_send_typing)
+        adapter.stop_typing = MagicMock(return_value=asyncio.sleep(0))
+        adapter.pause_typing_for_chat("forum-chat", metadata={"thread_id": "194"})
+
+        stop_event = asyncio.Event()
+        task = asyncio.create_task(
+            adapter._keep_typing(
+                chat_id="forum-chat",
+                interval=0.1,
+                metadata={"thread_id": "11"},
+                stop_event=stop_event,
+            )
+        )
+        await asyncio.sleep(0.25)
+        stop_event.set()
+        await asyncio.wait_for(task, timeout=1.0)
+
+        assert calls, "pausing topic 194 incorrectly suppressed typing in topic 11"
+
+    @pytest.mark.asyncio
     async def test_stop_typing_refresh_blocks_late_cancel_tick(self, monkeypatch):
         """Final cleanup must not let a cancelled refresh loop send typing again."""
         adapter = _StubAdapter()

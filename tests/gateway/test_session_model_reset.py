@@ -3,7 +3,17 @@ from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
-import pytest
+try:
+    import pytest
+    _has_pytest = True
+except ImportError:
+    _has_pytest = False
+    class _DummyPytest:
+        class mark:
+            @staticmethod
+            def asyncio(f):
+                return f
+    pytest = _DummyPytest()
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
@@ -62,13 +72,14 @@ def _make_runner():
     runner._agent_cache_lock = None  # disables _evict_cached_agent lock path
     runner._is_user_authorized = lambda _source: True
     runner._format_session_info = lambda: ""
+    runner.session_store.set_model_override = MagicMock()
 
     return runner
 
 
 @pytest.mark.asyncio
-async def test_new_command_clears_session_model_override():
-    """/new must remove the session-scoped model override for that session."""
+async def test_new_command_preserves_session_model_override():
+    """/new keeps the explicitly selected model for the fresh conversation."""
     runner = _make_runner()
     session_key = build_session_key(_make_source())
 
@@ -85,7 +96,8 @@ async def test_new_command_clears_session_model_override():
 
     await runner._handle_reset_command(_make_event("/new"))
 
-    assert session_key not in runner._session_model_overrides
+    assert runner._session_model_overrides[session_key]["model"] == "gpt-4o"
+    runner.session_store.set_model_override.assert_called_once()
     assert session_key not in runner._session_reasoning_overrides
     assert session_key not in runner._pending_model_notes
 
@@ -106,8 +118,8 @@ async def test_new_command_no_override_is_noop():
 
 
 @pytest.mark.asyncio
-async def test_new_command_only_clears_own_session():
-    """/new must only clear the override for the session that triggered it."""
+async def test_new_command_preserves_own_session_model():
+    """/new preserves this chat's model without touching another chat."""
     runner = _make_runner()
     session_key = build_session_key(_make_source())
     other_key = "other_session_key"
@@ -133,9 +145,58 @@ async def test_new_command_only_clears_own_session():
 
     await runner._handle_reset_command(_make_event("/new"))
 
-    assert session_key not in runner._session_model_overrides
+    assert runner._session_model_overrides[session_key]["model"] == "gpt-4o"
     assert other_key in runner._session_model_overrides
     assert session_key not in runner._session_reasoning_overrides
     assert other_key in runner._session_reasoning_overrides
     assert session_key not in runner._pending_model_notes
     assert other_key in runner._pending_model_notes
+
+
+@pytest.mark.asyncio
+async def test_new_command_preserves_from_old_entry_when_ram_cache_empty():
+    """When in-memory overrides are empty (e.g. after restart), /new restores from old_entry.model_override."""
+    runner = _make_runner()
+    session_key = build_session_key(_make_source())
+
+    # RAM cache is empty
+    runner._session_model_overrides.clear()
+
+    # But old_entry has a persisted model_override
+    old_entry = runner.session_store._entries[session_key]
+    old_entry.model_override = {
+        "model": "glm-5.3-flash",
+        "provider": "custom",
+        "base_url": "https://example.com/v1",
+    }
+
+    await runner._handle_reset_command(_make_event("/new"))
+
+    assert runner._session_model_overrides[session_key]["model"] == "glm-5.3-flash"
+    runner.session_store.set_model_override.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_new_command_banner_passes_inherited_override():
+    """Verify that _reset_notice_session_info receives the inherited override."""
+    runner = _make_runner()
+    session_key = build_session_key(_make_source())
+
+    runner._session_model_overrides[session_key] = {
+        "model": "glm-5.3-flash",
+        "provider": "custom",
+    }
+
+    captured_override = []
+
+    def mock_notice_info(source, override=None):
+        captured_override.append(override)
+        return "mock_info"
+
+    runner._reset_notice_session_info = mock_notice_info
+
+    await runner._handle_reset_command(_make_event("/new"))
+
+    assert len(captured_override) == 1
+    assert captured_override[0]["model"] == "glm-5.3-flash"
+

@@ -119,6 +119,8 @@ class GatewaySlashCommandsMixin:
     async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
         source = event.source
+        if hasattr(self, "_normalize_source_for_session_key"):
+            source = await asyncio.to_thread(self._normalize_source_for_session_key, source)
         
         # Get existing session key
         session_key = self._session_key_for_source(source)
@@ -132,7 +134,37 @@ class GatewaySlashCommandsMixin:
 
         # Snapshot the old entry so on_session_finalize can report the
         # expiring session id before reset_session() rotates it.
-        old_entry = self.session_store._entries.get(session_key)
+        old_entry = self.session_store._entries.get(session_key) if getattr(self, "session_store", None) else None
+
+        # Rehydrate from SQLite/store if gateway restarted or RAM cache dropped it
+        if session_key and hasattr(self, "_rehydrate_session_model_override"):
+            try:
+                self._rehydrate_session_model_override(session_key)
+            except Exception:
+                pass
+
+        # A fresh conversation should inherit the model explicitly selected
+        # for this chat, without promoting it to the global default. Snapshot
+        # it before the generic conversation-scope cleanup below.
+        inherited_model_override = getattr(self, "_session_model_overrides", {}).get(session_key)
+        if not inherited_model_override and old_entry and getattr(old_entry, "model_override", None):
+            raw_ov = old_entry.model_override
+            if isinstance(raw_ov, dict) and isinstance(raw_ov.get("model"), str):
+                inherited_model_override = dict(raw_ov)
+                provider = inherited_model_override.get("provider")
+                if provider and not inherited_model_override.get("api_key"):
+                    try:
+                        from gateway.run import _resolve_runtime_agent_kwargs_for_provider
+                        runtime = _resolve_runtime_agent_kwargs_for_provider(provider)
+                        inherited_model_override["api_key"] = runtime.get("api_key")
+                        inherited_model_override["api_mode"] = runtime.get("api_mode")
+                        inherited_model_override["credential_pool"] = runtime.get("credential_pool")
+                        if not inherited_model_override.get("base_url"):
+                            inherited_model_override["base_url"] = runtime.get("base_url")
+                    except Exception:
+                        pass
+        elif inherited_model_override:
+            inherited_model_override = dict(inherited_model_override)
 
         # Close tool resources on the old agent (terminal sandboxes, browser
         # daemons, background processes) before evicting from cache.
@@ -216,6 +248,18 @@ class GatewaySlashCommandsMixin:
         # Reset the session
         new_entry = await self.async_session_store.reset_session(session_key)
 
+        if inherited_model_override:
+            self._session_model_overrides[session_key] = inherited_model_override
+            try:
+                await self.async_session_store.set_model_override(
+                    session_key, inherited_model_override
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to carry model override across /new",
+                    exc_info=True,
+                )
+
         # (Conversation-scoped overrides + security state were already
         # cleared via _clear_conversation_scope above.)
 
@@ -253,7 +297,7 @@ class GatewaySlashCommandsMixin:
         # reports the profile's model, not the base config's (#59003).
         try:
             session_info = await asyncio.to_thread(
-                self._reset_notice_session_info, source
+                self._reset_notice_session_info, source, inherited_model_override
             )
         except Exception:
             session_info = ""

@@ -325,7 +325,29 @@ class RelayRuntime:
                         allow_closing=True,
                     )
                 except Exception as exc:
-                    failures.append(f"session scope close failed: {exc}")
+                    _close_msg = str(exc).lower()
+                    if "not at the top" in _close_msg or "invalid argument" in _close_msg:
+                        try:
+                            _top = self.run_in_session(
+                                session,
+                                self.relay.scope.get_handle,
+                                allow_closing=True,
+                            )
+                            self.run_in_session(
+                                session,
+                                self.relay.scope.pop,
+                                _top,
+                                output={},
+                                metadata={
+                                    RUNTIME_SCHEMA_KEY: RUNTIME_SCHEMA_VERSION,
+                                    RUNTIME_INSTANCE_KEY: self.runtime_id,
+                                },
+                                allow_closing=True,
+                            )
+                        except Exception as exc2:
+                            failures.append(f"session scope close failed: {exc} (fallback also failed: {exc2})")
+                    else:
+                        failures.append(f"session scope close failed: {exc}")
         try:
             self.relay.subscribers.flush()
         except Exception as exc:
@@ -651,10 +673,42 @@ class RelaySessionCoordinator:
                                     RUNTIME_INSTANCE_KEY: lease.host.runtime_id,
                                 },
                             )
-                        except Exception:
-                            logger.warning(
-                                "Hermes Relay turn finalization failed", exc_info=True
-                            )
+                        except Exception as _scope_err:
+                            # "scope handle is not at the top of the stack"
+                            # happens when a prior interrupt/broken-pipe race
+                            # corrupts the scope stack ordering.  The scope is
+                            # already in an inconsistent state — popping by
+                            # handle fails.  Fall back to popping the top of
+                            # stack (best-effort cleanup) so the session can
+                            # close without leaking the orphaned scope.
+                            _scope_msg = str(_scope_err).lower()
+                            if "not at the top" in _scope_msg or "invalid argument" in _scope_msg:
+                                try:
+                                    _top_handle = lease.host.run_in_session(
+                                        lease.session,
+                                        lease.host.relay.scope.get_handle,
+                                    )
+                                    lease.host.run_in_session(
+                                        lease.session,
+                                        lease.host.relay.scope.pop,
+                                        _top_handle,
+                                        output={"outcome": outcome},
+                                        metadata={
+                                            RUNTIME_SCHEMA_KEY: RUNTIME_SCHEMA_VERSION,
+                                            RUNTIME_INSTANCE_KEY: lease.host.runtime_id,
+                                        },
+                                    )
+                                except Exception:
+                                    logger.debug(
+                                        "Relay scope fallback pop also failed; "
+                                        "session scope stack is inconsistent",
+                                        exc_info=True,
+                                    )
+                            else:
+                                logger.warning(
+                                    "Hermes Relay turn finalization failed",
+                                    exc_info=True,
+                                )
             finally:
                 try:
                     # Delegated agents own one turn. Close their conversation

@@ -3729,18 +3729,21 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             or _is_sse_conn_err_preview
                             or _is_stream_parse_err
                         )
+                        # Allow retry for transient connection errors even
+                        # without a tool call in-flight.  The stream consumer
+                        # deduplicates identical text (line ~2032), so a retry
+                        # that re-sends already-delivered text is safe — the
+                        # consumer skips identical frames.  Previously, pure-
+                        # text responses that hit a broken pipe after partial
+                        # delivery were NOT retried, producing an empty stub
+                        # that rendered as an empty Telegram message.
                         _can_silent_retry = (
-                            _partial_tool_in_flight
-                            and _is_transient
+                            _is_transient
                             and _stream_attempt < _max_stream_retries
                         )
                         if not _can_silent_retry:
-                            # Either no tool call was in-flight (so the
-                            # turn was a pure text response — current
-                            # stub-with-recovered-text behaviour is
-                            # correct), or retries are exhausted, or the
-                            # error isn't transient.  Fall through to the
-                            # stub path.
+                            # Retries are exhausted, or the error isn't
+                            # transient.  Fall through to the stub path.
                             logger.warning(
                                 "Streaming failed after partial delivery, not retrying: %s", e
                             )

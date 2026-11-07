@@ -4590,7 +4590,8 @@ class BasePlatformAdapter(ABC):
             while True:
                 if stop_event is not None and stop_event.is_set():
                     return
-                if chat_id not in self._typing_paused:
+                typing_scope = self._typing_scope_key(chat_id, metadata)
+                if typing_scope not in self._typing_paused:
                     try:
                         await asyncio.wait_for(
                             self.send_typing(chat_id, metadata=metadata),
@@ -4635,7 +4636,7 @@ class BasePlatformAdapter(ABC):
                     await self._stop_typing_with_metadata(chat_id, metadata)
                 except Exception:
                     pass
-            self._typing_paused.discard(chat_id)
+            self._typing_paused.discard(self._typing_scope_key(chat_id, metadata))
             # getattr-guard: bare object.__new__() adapters in tests lack
             # _status_text (same class of issue as _typing_paused, but that
             # one is always present because those tests predate it).
@@ -4651,7 +4652,8 @@ class BasePlatformAdapter(ABC):
         stop_attempts: int = 2,
     ) -> None:
         """Stop the refresh task and platform typing state as one operation."""
-        self._typing_paused.add(chat_id)
+        typing_scope = self._typing_scope_key(chat_id, metadata)
+        self._typing_paused.add(typing_scope)
         try:
             if typing_task is not None and not typing_task.done():
                 typing_task.cancel()
@@ -4672,19 +4674,25 @@ class BasePlatformAdapter(ABC):
                 if attempt < attempts - 1:
                     await asyncio.sleep(0)
         finally:
-            self._typing_paused.discard(chat_id)
+            self._typing_paused.discard(typing_scope)
 
-    def pause_typing_for_chat(self, chat_id: str) -> None:
-        """Pause typing indicator for a chat (e.g. during approval waits).
+    @staticmethod
+    def _typing_scope_key(chat_id: str, metadata=None) -> str:
+        """Key typing state by conversation lane, not only parent chat."""
+        thread_id = metadata.get("thread_id") if isinstance(metadata, dict) else None
+        return f"{chat_id}:{thread_id}" if thread_id is not None else str(chat_id)
+
+    def pause_typing_for_chat(self, chat_id: str, metadata=None) -> None:
+        """Pause typing indicator for a chat or specific thread (e.g. during approval waits).
 
         Thread-safe (CPython GIL) — can be called from the sync agent thread
         while ``_keep_typing`` runs on the async event loop.
         """
-        self._typing_paused.add(chat_id)
+        self._typing_paused.add(self._typing_scope_key(chat_id, metadata))
 
-    def resume_typing_for_chat(self, chat_id: str) -> None:
-        """Resume typing indicator for a chat after approval resolves."""
-        self._typing_paused.discard(chat_id)
+    def resume_typing_for_chat(self, chat_id: str, metadata=None) -> None:
+        """Resume typing indicator for a chat or thread after approval resolves."""
+        self._typing_paused.discard(self._typing_scope_key(chat_id, metadata))
 
     async def interrupt_session_activity(self, session_key: str, chat_id: str, metadata=None) -> None:
         """Signal the active session loop to stop and clear typing immediately."""

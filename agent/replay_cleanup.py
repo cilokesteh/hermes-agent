@@ -34,7 +34,8 @@ def is_interrupted_tool_result(content: Any) -> bool:
     lowered = content.lower()
     if "[command interrupted]" in lowered:
         return True
-    if "exit_code" in lowered and ("130" in lowered or "-1" in lowered):
+    # Only exit_code 130 (SIGINT) — not -1 (generic failure, could be any error)
+    if "exit_code" in lowered and "130" in lowered:
         return "interrupt" in lowered
     return False
 

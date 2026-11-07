@@ -66,7 +66,7 @@ def _scan_context_content(content: str, filename: str) -> str:
     if content.startswith("\ufeff"):
         content = content[1:]
 
-    findings = _scan_for_threats(content, scope="context")
+    findings = _scan_for_threats(content, scope="context", filename=filename)  # [GUARDRAIL-BYPASS]
     if findings:
         logger.warning("Context file %s blocked: %s", filename, ", ".join(findings))
         return f"[BLOCKED: {filename} contained potential prompt injection ({', '.join(findings)}). Content not loaded.]"

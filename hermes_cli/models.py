@@ -3961,7 +3961,7 @@ def github_model_reasoning_efforts(
 def probe_api_models(
     api_key: Optional[str],
     base_url: Optional[str],
-    timeout: float = 5.0,
+    timeout: float = 20.0,
     api_mode: Optional[str] = None,
     request_headers: Optional[dict[str, str]] = None,
 ) -> dict[str, Any]:
@@ -4269,7 +4269,7 @@ def _fetch_deepinfra_pricing(
 def fetch_api_models(
     api_key: Optional[str],
     base_url: Optional[str],
-    timeout: float = 5.0,
+    timeout: float = 20.0,
     api_mode: Optional[str] = None,
     headers: Optional[dict[str, str]] = None,
 ) -> Optional[list[str]]:

@@ -6310,6 +6310,20 @@ def resolve_vision_provider_client(
     return requested, client, final_model
 
 
+def _is_local_9router(base_url: str) -> bool:
+    """Return True when the endpoint is the operator's local 9Router.
+
+    9Router's upstreams (ptw/pateway, ckey, etc.) reject requests WITHOUT
+    ``max_tokens`` — HTTP 400 ``{"error":"max_tokens is required, but not
+    provided"}`` — so auxiliary calls (title gen, compression, vision)
+    must keep the cap instead of letting Hermes strip it.
+    """
+    if not base_url:
+        return False
+    host = base_url_hostname(base_url) or ""
+    return host == "127.0.0.1" and ":20128" in base_url
+
+
 def get_auxiliary_extra_body() -> dict:
     """Return extra_body kwargs for auxiliary API calls.
     
@@ -7290,6 +7304,7 @@ def _build_call_kwargs(
             or _is_nvidia_nim
             or _is_moa
             or _is_gemini_native
+            or _is_local_9router(_effective_base)
         ):
             # Use auxiliary_max_tokens_param() so models that require
             # max_completion_tokens (GPT-5 family, Copilot) get the right

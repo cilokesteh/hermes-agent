@@ -118,6 +118,24 @@ class TestStalenessCheck(unittest.TestCase):
         self.assertIn("modified since you last read", result["_warning"])
 
     @patch("tools.file_tools._get_file_ops")
+    def test_kill_switch_env_var_suppresses_warning(self, mock_ops):
+        """HERMES_DISABLE_FILE_STATE_GUARD=1 turns off the per-task staleness warning."""
+        mock_ops.return_value = _make_fake_ops("original content\n", 18)
+        os.environ["HERMES_DISABLE_FILE_STATE_GUARD"] = "1"
+        try:
+            read_file_tool(self._tmpfile, task_id="t1")
+
+            # Simulate external modification
+            time.sleep(0.05)
+            with open(self._tmpfile, "w") as f:
+                f.write("someone else changed this\n")
+
+            result = json.loads(write_file_tool(self._tmpfile, "new content", task_id="t1"))
+            self.assertNotIn("_warning", result)
+        finally:
+            del os.environ["HERMES_DISABLE_FILE_STATE_GUARD"]
+
+    @patch("tools.file_tools._get_file_ops")
     def test_no_warning_when_file_never_read(self, mock_ops):
         """Writing a file that was never read — no warning."""
         mock_ops.return_value = _make_fake_ops()

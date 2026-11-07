@@ -1504,13 +1504,27 @@ def _update_read_timestamp(filepath: str, task_id: str) -> None:
             _cap_read_tracker_data(task_data)
 
 
+def _file_state_guard_disabled() -> bool:
+    """True when the file-state guard kill switch is set (``=1``).
+
+    Mirrors ``file_state._disabled()`` — re-read per call so tests can
+    toggle via monkeypatch.setenv.
+    """
+    return os.environ.get("HERMES_DISABLE_FILE_STATE_GUARD", "").strip() == "1"
+
+
 def _check_file_staleness(filepath: str, task_id: str) -> str | None:
     """Check whether a file was modified since the agent last read it.
 
     Returns a warning string if the file is stale (mtime changed since
     the last read_file call for this task), or None if the file is fresh
     or was never read.  Does not block — the write still proceeds.
+
+    No-ops when ``HERMES_DISABLE_FILE_STATE_GUARD=1`` (same kill switch
+    as ``tools.file_state``), so the env var turns off the whole guard.
     """
+    if _file_state_guard_disabled():
+        return None
     try:
         resolved = str(_resolve_path_for_task(filepath, task_id))
     except (OSError, ValueError):

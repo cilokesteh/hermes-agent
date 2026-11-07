@@ -5726,6 +5726,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._choice_picker_state.pop(chat_id, None)
 
     _MODEL_PAGE_SIZE = 8
+    _PREFIX_PAGE_SIZE = 12
 
     def _build_provider_keyboard(self, providers: list, page: int = 0) -> tuple:
         """Build the paginated top-level provider keyboard, folding groups.
@@ -5839,6 +5840,72 @@ class TelegramAdapter(BasePlatformAdapter):
         page_info = f" ({start + 1}–{end} of {total})" if total_pages > 1 else ""
         return InlineKeyboardMarkup(rows), page_info
 
+    def _extract_prefixes(self, models: list) -> tuple:
+        """Extract unique prefixes from model IDs like 'prefix/model-name'.
+        
+        Returns (prefixes, prefix_to_models) where prefixes is sorted list
+        of unique prefixes, and prefix_to_models is dict mapping prefix -> [model_ids].
+        If no prefix patterns found, returns (None, None).
+        """
+        prefix_to_models = {}
+        has_prefix = False
+        for m in models:
+            if "/" in m:
+                has_prefix = True
+                prefix = m.split("/")[0]
+                prefix_to_models.setdefault(prefix, []).append(m)
+            else:
+                prefix_to_models.setdefault("_", []).append(m)
+        
+        if not has_prefix:
+            return None, None
+        
+        prefixes = sorted(p for p in prefix_to_models if p != "_")
+        if "_" in prefix_to_models:
+            prefixes.append("_")
+        return prefixes, prefix_to_models
+
+    def _build_prefix_keyboard(self, prefix_groups: dict, page: int = 0) -> tuple:
+        """Build paginated prefix selection keyboard."""
+        entries = []
+        for prefix in sorted(prefix_groups.keys()):
+            models = prefix_groups[prefix]
+            label = f"▸ {prefix} ({len(models)})" if prefix != "_" else f"▸ Other ({len(models)})"
+            entries.append((prefix, label))
+        
+        page_size = self._PREFIX_PAGE_SIZE
+        total = len(entries)
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        page = max(0, min(page, total_pages - 1))
+        
+        start = page * page_size
+        end = min(start + page_size, total)
+        page_entries = entries[start:end]
+        
+        buttons = [
+            InlineKeyboardButton(label, callback_data=f"mpp:{prefix}")
+            for prefix, label in page_entries
+        ]
+        
+        rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+        
+        if total_pages > 1:
+            nav = []
+            if page > 0:
+                nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"mppv:{page - 1}"))
+            nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="mx:noop"))
+            if page < total_pages - 1:
+                nav.append(InlineKeyboardButton("Next ▶", callback_data=f"mppv:{page + 1}"))
+            rows.append(nav)
+        
+        rows.append([
+            InlineKeyboardButton("◀ Back", callback_data="mb"),
+            InlineKeyboardButton("✗ Cancel", callback_data="mx"),
+        ])
+        
+        page_info = f" ({start + 1}–{end} of {total})" if total_pages > 1 else ""
+        return InlineKeyboardMarkup(rows), page_info
+
     async def _handle_model_picker_callback(
         self, query, data: str, chat_id: str
     ) -> None:
@@ -5855,7 +5922,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 return slug
 
         if data.startswith("mp:"):
-            # --- Provider selected: show model buttons (page 0) ---
+            # --- Provider selected: check for prefix groups or show models ---
             provider_slug = data[3:]
             provider = next(
                 (p for p in state["providers"] if p["slug"] == provider_slug),
@@ -5870,20 +5937,100 @@ class TelegramAdapter(BasePlatformAdapter):
             state["selected_provider_name"] = provider.get("name", provider_slug)
             state["model_list"] = models
             state["model_page"] = 0
+            state["prefix_page"] = 0
 
-            keyboard, page_info = self._build_model_keyboard(models, 0)
-
+            # Check if models have prefix patterns (e.g. "prefix/model-name")
+            prefixes, prefix_groups = self._extract_prefixes(models)
             pname = provider.get("name", provider_slug)
-            total = provider.get("total_models", len(models))
-            shown = len(models)
-            extra = f"\n_{total - shown} more available — type `/model <name>` directly_" if total > shown else ""
 
+            if prefixes and len(prefixes) > 1 and len(models) > 15:
+                # Show prefix selection first
+                state["view"] = "prefixes"
+                state["prefix_groups"] = prefix_groups
+                keyboard, page_info = self._build_prefix_keyboard(prefix_groups, 0)
+
+                await query.edit_message_text(
+                    text=self.format_message(
+                        (
+                            f"⚙ *Model Configuration*\n\n"
+                            f"Provider: *{pname}*\n"
+                            f"Select a provider prefix:{page_info}"
+                        )
+                    ),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=keyboard,
+                )
+            else:
+                # Show models directly (no prefix grouping needed)
+                state["view"] = "models"
+                keyboard, page_info = self._build_model_keyboard(models, 0)
+
+                total = provider.get("total_models", len(models))
+                shown = len(models)
+                extra = f"\n_{total - shown} more available — type `/model <name>` directly_" if total > shown else ""
+
+                await query.edit_message_text(
+                    text=self.format_message(
+                        (
+                            f"⚙ *Model Configuration*\n\n"
+                            f"Provider: *{pname}*{page_info}\n"
+                            f"Select a model:{extra}"
+                        )
+                    ),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=keyboard,
+                )
+            await query.answer()
+
+        elif data.startswith("mpp:"):
+            # --- Prefix selected: show models for this prefix ---
+            prefix = data[4:]
+            prefix_groups = state.get("prefix_groups", {})
+            prefixed_models = prefix_groups.get(prefix, [])
+            if not prefixed_models:
+                await query.answer(text="Prefix not found.")
+                return
+
+            state["view"] = "models"
+            state["selected_prefix"] = prefix
+            state["model_list"] = prefixed_models
+            state["model_page"] = 0
+
+            keyboard, page_info = self._build_model_keyboard(prefixed_models, 0)
+
+            pname = state.get("selected_provider_name", "")
             await query.edit_message_text(
                 text=self.format_message(
                     (
                         f"⚙ *Model Configuration*\n\n"
-                        f"Provider: *{pname}*{page_info}\n"
-                        f"Select a model:{extra}"
+                        f"Provider: *{pname}* ▸ *{prefix}*{page_info}\n"
+                        f"Select a model:"
+                    )
+                ),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=keyboard,
+            )
+            await query.answer()
+
+        elif data.startswith("mppv:"):
+            # --- Prefix page navigation ---
+            try:
+                page = int(data[5:])
+            except ValueError:
+                await query.answer(text="Invalid page.")
+                return
+
+            prefix_groups = state.get("prefix_groups", {})
+            state["prefix_page"] = page
+            keyboard, page_info = self._build_prefix_keyboard(prefix_groups, page)
+
+            pname = state.get("selected_provider_name", "")
+            await query.edit_message_text(
+                text=self.format_message(
+                    (
+                        f"⚙ *Model Configuration*\n\n"
+                        f"Provider: *{pname}*\n"
+                        f"Select a provider prefix:{page_info}"
                     )
                 ),
                 parse_mode=ParseMode.MARKDOWN_V2,
@@ -5905,26 +6052,44 @@ class TelegramAdapter(BasePlatformAdapter):
             keyboard, page_info = self._build_model_keyboard(models, page)
 
             pname = state.get("selected_provider_name", "")
+            prefix = state.get("selected_prefix", "")
             provider_slug = state.get("selected_provider", "")
             provider = next(
                 (p for p in state["providers"] if p["slug"] == provider_slug),
                 None,
             )
-            total = provider.get("total_models", len(models)) if provider else len(models)
-            shown = len(models)
-            extra = f"\n_{total - shown} more available — type `/model <name>` directly_" if total > shown else ""
+            
+            if prefix:
+                # In prefix-filtered view: show prefix in title
+                total = len(models)
+                shown = len(models)
+                await query.edit_message_text(
+                    text=self.format_message(
+                        (
+                            f"⚙ *Model Configuration*\n\n"
+                            f"Provider: *{pname}* ▸ *{prefix}*{page_info}\n"
+                            f"Select a model:"
+                        )
+                    ),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=keyboard,
+                )
+            else:
+                total = provider.get("total_models", len(models)) if provider else len(models)
+                shown = len(models)
+                extra = f"\n_{total - shown} more available — type `/model <name>` directly_" if total > shown else ""
 
-            await query.edit_message_text(
-                text=self.format_message(
-                    (
-                        f"⚙ *Model Configuration*\n\n"
-                        f"Provider: *{pname}*{page_info}\n"
-                        f"Select a model:{extra}"
-                    )
-                ),
-                parse_mode=ParseMode.MARKDOWN_V2,
-                reply_markup=keyboard,
-            )
+                await query.edit_message_text(
+                    text=self.format_message(
+                        (
+                            f"⚙ *Model Configuration*\n\n"
+                            f"Provider: *{pname}*{page_info}\n"
+                            f"Select a model:{extra}"
+                        )
+                    ),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=keyboard,
+                )
             await query.answer()
 
         elif data.startswith("mpv:"):
@@ -6136,29 +6301,52 @@ class TelegramAdapter(BasePlatformAdapter):
             await query.answer()
 
         elif data == "mb":
-            # --- Back to provider list (folds groups) ---
-            page = int(state.get("provider_page", 0) or 0)
-            keyboard, provider_page_info = self._build_provider_keyboard(
-                state["providers"], page
-            )
+            # --- Back: navigate up one level ---
+            state_view = state.get("view", "prefixes")
+            
+            if state_view == "models" and state.get("prefix_groups"):
+                # Models view with prefixes: back to prefix selection
+                prefix_groups = state["prefix_groups"]
+                prefix_page = int(state.get("prefix_page", 0) or 0)
+                state["view"] = "prefixes"
+                keyboard, page_info = self._build_prefix_keyboard(prefix_groups, prefix_page)
+                
+                pname = state.get("selected_provider_name", "")
+                await query.edit_message_text(
+                    text=self.format_message(
+                        (
+                            f"⚙ *Model Configuration*\n\n"
+                            f"Provider: *{pname}*\n"
+                            f"Select a provider prefix:{page_info}"
+                        )
+                    ),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=keyboard,
+                )
+            else:
+                # Back to provider list (folds groups)
+                page = int(state.get("provider_page", 0) or 0)
+                keyboard, provider_page_info = self._build_provider_keyboard(
+                    state["providers"], page
+                )
 
-            try:
-                provider_label = get_label(state["current_provider"])
-            except Exception:
-                provider_label = state["current_provider"]
+                try:
+                    provider_label = get_label(state["current_provider"])
+                except Exception:
+                    provider_label = state["current_provider"]
 
-            await query.edit_message_text(
-                text=self.format_message(
-                    (
-                        f"⚙ *Model Configuration*\n\n"
-                        f"Current model: `{state['current_model'] or 'unknown'}`\n"
-                        f"Provider: {provider_label}\n\n"
-                        f"Select a provider:{provider_page_info}"
-                    )
-                ),
-                parse_mode=ParseMode.MARKDOWN_V2,
-                reply_markup=keyboard,
-            )
+                await query.edit_message_text(
+                    text=self.format_message(
+                        (
+                            f"⚙ *Model Configuration*\n\n"
+                            f"Current model: `{state['current_model'] or 'unknown'}`\n"
+                            f"Provider: {provider_label}\n\n"
+                            f"Select a provider:{provider_page_info}"
+                        )
+                    ),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=keyboard,
+                )
             await query.answer()
 
         elif data == "mx":
@@ -6215,7 +6403,7 @@ class TelegramAdapter(BasePlatformAdapter):
         query_user_name = getattr(query.from_user, "first_name", None)
 
         # --- Model picker callbacks ---
-        if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):
+        if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:", "mpp:", "mppv:")):
             chat_id = str(query.message.chat_id) if query.message else None
             if chat_id:
                 await self._handle_model_picker_callback(query, data, chat_id)
@@ -7379,8 +7567,11 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         return False
 
-    def _record_typing_cooldown(self, chat_id: str, exc: Exception) -> None:
-        """Suppress Telegram typing refreshes for this chat after transient failures."""
+    def _typing_cooldown_key(self, chat_id: str, message_thread_id: Optional[int] = None) -> str:
+        return f"{chat_id}:{message_thread_id}" if message_thread_id is not None else str(chat_id)
+
+    def _record_typing_cooldown(self, chat_id: str, exc: Exception, message_thread_id: Optional[int] = None) -> None:
+        """Suppress Telegram typing refreshes for this chat/topic after transient failures."""
         if not hasattr(self, "_telegram_typing_cooldown_until"):
             self._telegram_typing_cooldown_until = {}
         loop = asyncio.get_running_loop()
@@ -7390,37 +7581,39 @@ class TelegramAdapter(BasePlatformAdapter):
         except (TypeError, ValueError):
             delay = self._telegram_typing_cooldown_seconds
         delay = max(1.0, min(delay, 300.0))
-        self._telegram_typing_cooldown_until[str(chat_id)] = loop.time() + delay
+        key = self._typing_cooldown_key(chat_id, message_thread_id)
+        self._telegram_typing_cooldown_until[key] = loop.time() + delay
 
-    def _typing_in_cooldown(self, chat_id: str) -> bool:
+    def _typing_in_cooldown(self, chat_id: str, message_thread_id: Optional[int] = None) -> bool:
         if not hasattr(self, "_telegram_typing_cooldown_until"):
             self._telegram_typing_cooldown_until = {}
             self._telegram_typing_cooldown_seconds = 30.0
-        until = self._telegram_typing_cooldown_until.get(str(chat_id))
+        key = self._typing_cooldown_key(chat_id, message_thread_id)
+        until = self._telegram_typing_cooldown_until.get(key)
         if until is None:
             return False
         if asyncio.get_running_loop().time() < until:
             return True
-        self._telegram_typing_cooldown_until.pop(str(chat_id), None)
+        self._telegram_typing_cooldown_until.pop(key, None)
         return False
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Send typing indicator."""
-        if not self._bot or self._typing_in_cooldown(chat_id):
+        _typing_thread = self._metadata_thread_id(metadata)
+        message_thread_id = self._message_thread_id_for_typing(_typing_thread)
+        if not self._bot or self._typing_in_cooldown(chat_id, message_thread_id):
             return
 
         _is_dm_topic: bool = False
-        message_thread_id: Optional[int] = None
         try:
-            _typing_thread = self._metadata_thread_id(metadata)
             _is_dm_topic = bool(metadata and metadata.get("telegram_dm_topic_reply_fallback"))
-            message_thread_id = self._message_thread_id_for_typing(_typing_thread)
             await self._bot.send_chat_action(
                 chat_id=normalize_telegram_chat_id(chat_id),
                 action="typing",
                 message_thread_id=message_thread_id,
             )
-            self._telegram_typing_cooldown_until.pop(str(chat_id), None)
+            key = self._typing_cooldown_key(chat_id, message_thread_id)
+            self._telegram_typing_cooldown_until.pop(key, None)
         except Exception as e:
             # For DM topic lanes, Telegram may reject message_thread_id.
             # Fall back to sending typing without thread_id so the typing
@@ -7431,13 +7624,14 @@ class TelegramAdapter(BasePlatformAdapter):
                         chat_id=normalize_telegram_chat_id(chat_id),
                         action="typing",
                     )
-                    self._telegram_typing_cooldown_until.pop(str(chat_id), None)
+                    key = self._typing_cooldown_key(chat_id, None)
+                    self._telegram_typing_cooldown_until.pop(key, None)
                     return
                 except Exception as fallback_exc:
                     if self._is_transient_typing_error(fallback_exc):
-                        self._record_typing_cooldown(chat_id, fallback_exc)
+                        self._record_typing_cooldown(chat_id, fallback_exc, None)
             elif self._is_transient_typing_error(e):
-                self._record_typing_cooldown(chat_id, e)
+                self._record_typing_cooldown(chat_id, e, message_thread_id)
             # Typing failures are non-fatal; log at debug level only.
             logger.debug(
                 "[%s] Failed to send Telegram typing indicator: %s",
